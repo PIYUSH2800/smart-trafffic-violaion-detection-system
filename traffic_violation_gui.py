@@ -43,6 +43,10 @@ from utils.violation_logger import (
     clear_violations, get_violation_count
 )
 from utils.helmet_detector import HelmetDetector
+from utils.lane_detector import WrongLaneDetector
+from utils.parking_detector import WrongParkingDetector
+from utils.signal_detector import RedLightDetector
+from utils.seatbelt_detector import SeatbeltDetector
 
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
@@ -55,6 +59,24 @@ try:
 except ImportError:
     ROBOFLOW_API_KEY = ""
     OCR_SPACE_API    = ""
+
+# Fallback: Parse .env file manually if python-decouple failed or wasn't used
+env_path = os.path.join(_DIR, ".env")
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if k not in os.environ:
+                    os.environ[k] = v
+
+if not ROBOFLOW_API_KEY:
+    ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
+if not OCR_SPACE_API:
+    OCR_SPACE_API    = os.environ.get("OCR_SPACE_API", "")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
@@ -100,6 +122,9 @@ VIO_DISPLAY = {
     "no_helmet":      ("🪖 No Helmet",  C_ORANGE),
     "wrong_lane":     ("🛣 Wrong Lane", C_PURPLE),
     "triple_riding":  ("👥 Triple",     C_PURPLE),
+    "wrong_parking":  ("🅿 Wrong Park", C_WARN),
+    "red_light":      ("🚦 Red Light",  C_RED),
+    "no_seatbelt":    ("💺 No Seatbelt", C_ORANGE),
 }
 
 
@@ -121,6 +146,7 @@ class TrafficViolationApp:
         self.pixels_per_meter = 20.0
         self.video_fps        = 25.0
         self.roi              = None        # (x, y, w, h)
+        self.light_roi        = None        # (x, y, w, h)
 
         self.running  = False
         self.paused   = False
@@ -146,6 +172,7 @@ class TrafficViolationApp:
         self._var_speed_limit   = tk.StringVar(value="—")
         self._var_violations    = tk.IntVar(value=0)
         self._var_helmet_vio    = tk.IntVar(value=0)
+        self._var_other_vio     = tk.IntVar(value=0)
         self._var_fps           = tk.StringVar(value="—")
         self._var_avg_speed     = tk.StringVar(value="—")
         self._var_status        = tk.StringVar(value="⬤  Idle")
@@ -251,6 +278,7 @@ class TrafficViolationApp:
             ("🪖 Helmet Vio",   self._var_helmet_vio,   "",     C_ORANGE, 0, 2),
             ("Current FPS",     self._var_fps,          "",     C_TEXT,   1, 0),
             ("Avg Speed",       self._var_avg_speed,    "km/h", C_TEXT,   1, 1),
+            ("🚥 Other Vio",    self._var_other_vio,    "",     C_PURPLE, 1, 2),
         ]
         for label, var, unit, fg, row, col in stats:
             card = tk.Frame(grid, bg=C_CARD, padx=10, pady=8)
@@ -392,6 +420,7 @@ class TrafficViolationApp:
 
         btn(bar, "📂  Open Video",       C_ACCENT,  self._open_video)
         btn(bar, "🚀  Set Speed Limit",  C_WARN,    self._ask_speed_limit)
+        btn(bar, "🚦  Light ROI",        C_WARN,    self._ask_light_roi)
         self._start_btn = btn(bar, "▶  Start Detection", C_GREEN, self._start_detection)
         self._pause_btn = btn(bar, "⏸  Pause",           C_CARD,  self._toggle_pause, state="disabled")
         self._stop_btn  = btn(bar, "⏹  Stop",            C_RED,   self._stop_detection, state="disabled")
@@ -441,6 +470,19 @@ class TrafficViolationApp:
             self.speed_limit_kmh = val
             self._var_speed_limit.set(f"{val:.0f}")
 
+    def _ask_light_roi(self):
+        if not self.video_path or not os.path.exists(self.video_path):
+            messagebox.showinfo("Select Video", "Please open a video first.")
+            return
+        cap = cv2.VideoCapture(self.video_path)
+        ok, frame = cap.read()
+        cap.release()
+        if ok:
+            frame = cv2.resize(frame, (1280, 720))
+            self.light_roi = self._select_roi(frame, title="Select Traffic Light Zone")
+            if self.light_roi:
+                self._set_status("Traffic light ROI set", C_GREEN)
+
     # ── Open video file ────────────────────────────────────────────────────────
     def _open_video(self):
         path = filedialog.askopenfilename(
@@ -462,7 +504,7 @@ class TrafficViolationApp:
                 self._paint_frame(cv2.resize(frame, (1280, 720)))
 
     # ── ROI selector (Tkinter Toplevel, no cv2 window) ──────────────────────
-    def _select_roi(self, first_frame: np.ndarray):
+    def _select_roi(self, first_frame: np.ndarray, title: str = "Select Monitoring Zone  —  Click & Drag"):
         """
         Show first_frame in a Toplevel; user clicks+drags to draw ROI.
         Returns (x, y, w, h) in original frame coordinates, or None.
@@ -751,6 +793,10 @@ class TrafficViolationApp:
             fps=self.video_fps,
             smooth_window=12,
         )
+        lane_det = WrongLaneDetector(expected_direction="down", min_distance=30.0)
+        park_det = WrongParkingDetector(time_threshold_s=5.0, speed_threshold_kmh=2.0)
+        light_det = RedLightDetector(red_threshold_ratio=1.5)
+        seatbelt_det = SeatbeltDetector(check_frames=5)
 
         self.event_q.put(("status", "Running", C_GREEN))
 
@@ -758,7 +804,7 @@ class TrafficViolationApp:
         cap = cv2.VideoCapture(self.video_path)
 
         frame_times: list[float] = []
-        INFER_EVERY = 2          # run TF inference every N-th frame
+        INFER_EVERY = 4          # run heavy TF inference every 4 frames to speed up FPS
         frame_idx   = 0
         last_boxes   = np.zeros((0, 4), dtype=np.float32)
         last_scores  = np.zeros((0,),   dtype=np.float32)
@@ -842,6 +888,15 @@ class TrafficViolationApp:
                     # ── Speed estimation ───────────────────────────────────
                     speeds = speed_est.update(vehicle_cents)
 
+                    # Clean up detectors
+                    active_ids = set(speeds.keys())
+                    lane_det.clean_up(active_ids)
+                    park_det.clean_up(active_ids)
+                    light_det.clean_up(active_ids)
+                    seatbelt_det.clean_up(active_ids)
+                    if self.light_roi:
+                        light_det.update_signal_state(frame, self.light_roi)
+
                     # Build reverse map centroid -> obj_id
                     cent_to_vid = {v: k for k, v in speed_est.tracker.objects.items()}
 
@@ -852,7 +907,22 @@ class TrafficViolationApp:
                         cls_id, L, T, R, B = info
                         vid = cent_to_vid.get(cent)
                         spd = speeds.get(vid, 0.0) if vid is not None else 0.0
-                        is_vio = (spd > self.speed_limit_kmh) and (spd > 3.0)
+
+                        is_overspeed = (spd > self.speed_limit_kmh) and (spd > 3.0)
+                        is_wrong_lane = False
+                        is_wrong_park = False
+                        is_red_light = False
+                        is_no_seatbelt = False
+                        
+                        if vid is not None:
+                            is_wrong_lane = lane_det.update(vid, cent)
+                            is_wrong_park = park_det.update(vid, spd)
+                            if cls_id == 3:  # Only check seatbelt for Cars
+                                is_no_seatbelt = seatbelt_det.update(vid, frame, L, T, R, B)
+                            if self.light_roi:
+                                is_red_light = light_det.check_violation(vid, spd, min_speed=10.0)
+
+                        is_vio = is_overspeed or is_wrong_lane or is_wrong_park or is_red_light or is_no_seatbelt
 
                         color = (0, 40, 220) if is_vio else (50, 210, 80)
                         cv2.rectangle(frame, (L, T), (R, B), color, 2)
@@ -872,20 +942,26 @@ class TrafficViolationApp:
                         if is_vio and vid is not None:
                             now_ts = time.time()
                             if now_ts - self._vio_cooldown.get(vid, 0.0) > self._COOLDOWN_S:
+                                v_type = "overspeeding"
+                                if is_no_seatbelt: v_type = "no_seatbelt"
+                                elif is_wrong_lane: v_type = "wrong_lane"
+                                elif is_wrong_park: v_type = "wrong_parking"
+                                elif is_red_light: v_type = "red_light"
+
                                 self._vio_cooldown[vid] = now_ts
                                 snap = self._save_snapshot(
                                     frame, L, T, R, B, vid, cls_id, spd,
-                                    vio_type="overspeeding")
+                                    vio_type=v_type)
                                 ts = log_violation(
                                     vid, cls_name,
                                     round(spd, 1), self.speed_limit_kmh,
                                     snap,
-                                    violation_type="overspeeding",
+                                    violation_type=v_type,
                                 )
                                 violations_this_frame.append({
                                     "vid": vid, "class": cls_name,
                                     "speed": spd, "snap": snap,
-                                    "ts": ts, "type": "overspeeding",
+                                    "ts": ts, "type": v_type,
                                 })
 
                     # ── Draw overlays ──────────────────────────────────────
@@ -918,6 +994,13 @@ class TrafficViolationApp:
                                 (10, 92),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 helmet_clr, 2, cv2.LINE_AA)
+
+                    if self.light_roi:
+                        lx, ly, lw, lh = self.light_roi
+                        cv2.rectangle(frame, (lx, ly), (lx+lw, ly+lh), (0, 255, 255), 2)
+                        st = light_det.signal_state
+                        col = (0, 0, 255) if st == "RED" else (0, 255, 0) if st == "GREEN" else (180, 180, 180)
+                        cv2.putText(frame, f"Light: {st}", (lx, max(20, ly-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
 
                     # VIOLATION FLASH banner
                     if violations_this_frame:
@@ -1090,7 +1173,7 @@ class TrafficViolationApp:
         # Info overlay
         cls_name = VEHICLE_CLASSES.get(cls_id, "Vehicle")
         lines = [
-            "OVER-SPEED VIOLATION",
+            f"{vio_type.upper().replace('_', ' ')} VIOLATION",
             f"{cls_name}  |  {speed:.1f} km/h",
             f"Limit: {self.speed_limit_kmh:.0f} km/h",
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1177,8 +1260,10 @@ class TrafficViolationApp:
                 self._var_avg_speed.set("—")
 
             if violations:
-                cur = self._var_violations.get()
-                self._var_violations.set(cur + len(violations))
+                n_over = sum(1 for v in violations if v["type"] == "overspeeding")
+                n_other = len(violations) - n_over
+                if n_over: self._var_violations.set(self._var_violations.get() + n_over)
+                if n_other: self._var_other_vio.set(self._var_other_vio.get() + n_other)
                 self._refresh_log()
 
             self._paint_frame(frame)
